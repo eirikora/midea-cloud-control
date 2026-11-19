@@ -37,7 +37,7 @@ Home Assistant cannot connect.
 This is cloud control. Be clear-eyed about what that means:
 
 - Requires internet access and Midea's servers being up.
-- State is **polled** (30 s default), not pushed.
+- State is **polled** (90 s base interval, spread up to 120 s), not pushed.
 - ~1 s round trip per command, versus near-instant local control.
 - Midea is retiring these APIs progressively; `transparent/send` could follow
   `getToken`.
@@ -56,8 +56,10 @@ download, restart Home Assistant.
 `/config/custom_components/` directory and restart.
 
 Then: **Settings → Devices & Services → Add Integration → Midea Cloud Control**.
-Enter the email and password of the app your appliance is registered in, pick
-the matching app from the dropdown, then select your appliance.
+Enter the email and password of the app your appliances are registered in, pick
+the matching app from the dropdown, then select one or more appliances. One
+account entry stores the credentials once and creates one climate entity per
+selected appliance.
 
 > The app selector matters. Picking the wrong one fails with a vague error,
 > because the clouds have separate user databases.
@@ -100,6 +102,52 @@ For anyone extending this. The frame sent in the `order` parameter is:
 Replies come back the same way. The decrypted reply is zero-padded past the end
 of the frame, so **truncate to the length declared in byte 1** before parsing —
 otherwise the padding is read as payload and fails CRC.
+
+## Shared-session architecture
+
+- `CloudSessionRegistry` owns one `MideaCloudClient` per normalized account and
+  cloud name. Legacy single-device entries also reuse this client.
+- A login lock collapses concurrent startup attempts into one real login.
+- Session errors 3106 and 3144 replace the complete `MideaAirCloud` object
+  before a bounded reauthentication attempt. This avoids carrying an expired
+  `sessionId` into login.
+- Requests share a semaphore and a minimum start interval. Initial refreshes are
+  queued centrally and coordinator intervals are deterministically spread.
+- Error 9999 and empty/network responses use bounded retries with exponential
+  backoff and jitter. Repeated login failures enter a cooldown.
+- Config entry version 2 represents an account containing multiple appliances.
+  Climate unique IDs remain the appliance IDs, preserving existing entity IDs
+  where Home Assistant's entity registry permits it.
+
+Version-1 entries migrate safely to version 2 as one-appliance account entries.
+They share a runtime session immediately, but are not automatically merged
+because deleting or merging config entries during startup could lose entity
+registry associations. Use **Configure** on one migrated entry to select all
+appliances, validate the entity mapping, and only then remove the other disabled
+legacy entries.
+
+The transparent-send transport necessarily uses private `midea-local` members
+(`_access_token`, `_make_general_data`, and `_api_request`). The manifest pins
+`midea-local==12.2.0`; upgrades require protocol tests and source review.
+
+## Development and tests
+
+This branch is tested with Python 3.13 and Home Assistant 2026.2.3:
+
+```bash
+python3.13 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/pytest -q
+.venv/bin/ruff check custom_components tests tools
+```
+
+Tests use scripted cloud objects only. They do not require credentials, contact
+Midea, or send appliance commands. Covered cases include 1/15-device session
+sharing, concurrent login, 3106/3144/9999 handling, network recovery, reference
+counting, request concurrency, and device-targeted temperature changes.
+
+See [the technical analysis](docs/ANALYSIS.md) and the
+[don-aurora deployment and rollback runbook](docs/DEPLOYMENT_DON_AURORA.md).
 
 ## Credits
 
