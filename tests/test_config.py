@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from custom_components.midea_cloud_control import async_migrate_entry
+from custom_components.midea_cloud_control.climate import MideaCloudClimate
 from custom_components.midea_cloud_control.config_flow import account_unique_id
 from custom_components.midea_cloud_control.const import (
     CONF_APPLIANCE_ID,
@@ -52,3 +53,24 @@ async def test_v1_migration_preserves_appliance_identity() -> None:
         {CONF_APPLIANCE_ID: 123, CONF_APPLIANCE_NAME: "Bedroom"}
     ]
     assert data[CONF_SCAN_INTERVAL] == 90
+
+
+def test_climate_unique_id_depends_only_on_appliance_id() -> None:
+    original = SimpleNamespace(
+        appliance_id=123,
+        appliance_name="Bedroom",
+        data=None,
+        last_update_success=True,
+    )
+    renamed = SimpleNamespace(
+        appliance_id=123,
+        appliance_name="Camera da letto",
+        data=None,
+        last_update_success=True,
+    )
+
+    original_entity = MideaCloudClimate(original, SimpleNamespace())  # type: ignore[arg-type]
+    renamed_entity = MideaCloudClimate(renamed, SimpleNamespace())  # type: ignore[arg-type]
+
+    assert original_entity.unique_id == "123"
+    assert renamed_entity.unique_id == original_entity.unique_id

@@ -8,5 +8,5 @@
   "iot_class": "cloud_polling",
   "issue_tracker": "https://github.com/AndreiVasile96/midea-cloud-control/issues",
   "requirements": ["midea-local==12.2.0", "msmart-ng==2026.11.0", "pycryptodome==3.24.1"],
-  "version": "0.2.0"
+  "version": "0.2.1"
 }

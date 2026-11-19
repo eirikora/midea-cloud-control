@@ -35,7 +35,7 @@ from .const import (
     MAX_SCAN_INTERVAL_SECONDS,
     MIN_SCAN_INTERVAL_SECONDS,
 )
-from .session import normalize_account
+from .session import get_session_registry, normalize_account
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -199,22 +199,16 @@ class MideaCloudOptionsFlow(OptionsFlow):
         """List current account appliances and save the selected subset."""
         errors: dict[str, str] = {}
         if not self._appliances:
-            runtime = self.hass.data.get(DOMAIN, {}).get(self._entry.entry_id)
-            client = runtime.client if runtime is not None else MideaCloudClient(
-                self._entry.data[CONF_USERNAME],
-                self._entry.data[CONF_PASSWORD],
-                self._entry.data[CONF_CLOUD],
-                session=async_get_clientsession(self.hass),
-            )
-            temporary_client = runtime is None
+            registry = get_session_registry(self.hass)
             try:
-                await client.connect()
-                self._appliances = await client.list_appliances()
-            except CloudError:
+                async with registry.lease(
+                    self._entry.data[CONF_USERNAME],
+                    self._entry.data[CONF_PASSWORD],
+                    self._entry.data[CONF_CLOUD],
+                ) as client:
+                    self._appliances = await client.list_appliances()
+            except (CloudError, ValueError):
                 errors["base"] = "cannot_connect"
-            finally:
-                if temporary_client:
-                    await client.close()
 
         if user_input is not None and not errors:
             selected = [int(value) for value in user_input[CONF_APPLIANCES]]

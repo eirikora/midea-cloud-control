@@ -72,3 +72,18 @@ async def test_release_keeps_shared_client_until_last_device() -> None:
     await registry.release("user@example.invalid", "NetHome Plus")
     assert registry.active_sessions == 0
     assert client.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_temporary_lease_preserves_persistent_session() -> None:
+    registry = CloudSessionRegistry(object(), client_factory=FakeClient)  # type: ignore[arg-type]
+    persistent = await registry.acquire("user@example.invalid", "pw", "NetHome Plus")
+
+    async with registry.lease(
+        "user@example.invalid", "pw", "NetHome Plus"
+    ) as temporary:
+        assert temporary is persistent
+        assert await registry.references("user@example.invalid", "NetHome Plus") == 2
+
+    assert await registry.references("user@example.invalid", "NetHome Plus") == 1
+    assert persistent.close_calls == 0

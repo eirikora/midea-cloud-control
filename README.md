@@ -107,6 +107,9 @@ otherwise the padding is read as payload and fails CRC.
 
 - `CloudSessionRegistry` owns one `MideaCloudClient` per normalized account and
   cloud name. Legacy single-device entries also reuse this client.
+- Opening **Configure** borrows that same client through a reference-counted
+  lease. A disabled entry therefore reuses any session held by another entry
+  for the account instead of creating an independent login.
 - A login lock collapses concurrent startup attempts into one real login.
 - Session errors 3106 and 3144 replace the complete `MideaAirCloud` object
   before a bounded reauthentication attempt. This avoids carrying an expired

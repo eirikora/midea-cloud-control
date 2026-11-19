@@ -5,15 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import aiohttp
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .client import MideaCloudClient
 from .const import (
+    DATA_SESSION_REGISTRY,
     DEFAULT_MAX_CONCURRENT_REQUESTS,
     DEFAULT_MIN_REQUEST_INTERVAL,
+    DOMAIN,
 )
 
 
@@ -106,8 +111,29 @@ class CloudSessionRegistry:
         if client is not None:
             await client.close()
 
+    @asynccontextmanager
+    async def lease(
+        self, account: str, password: str, cloud_name: str
+    ) -> AsyncIterator[MideaCloudClient]:
+        """Temporarily share a client without disturbing persistent users."""
+        client = await self.acquire(account, password, cloud_name)
+        try:
+            yield client
+        finally:
+            await self.release(account, cloud_name)
+
     async def references(self, account: str, cloud_name: str) -> int:
         """Return a session's reference count, primarily for tests."""
         async with self._lock:
             record = self._records.get(self.key(cloud_name, account))
             return record.references if record else 0
+
+
+def get_session_registry(hass: HomeAssistant) -> CloudSessionRegistry:
+    """Return the one central cloud-session registry for Home Assistant."""
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    registry = domain_data.get(DATA_SESSION_REGISTRY)
+    if registry is None:
+        registry = CloudSessionRegistry(async_get_clientsession(hass))
+        domain_data[DATA_SESSION_REGISTRY] = registry
+    return registry

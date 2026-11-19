@@ -10,7 +10,6 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .client import CloudError, CloudInvalidAuthError, MideaCloudClient
 from .const import (
@@ -25,7 +24,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import MideaCloudCoordinator
-from .session import CloudSessionRegistry
+from .session import CloudSessionRegistry, get_session_registry
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,18 +54,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-def _registry(hass: HomeAssistant) -> CloudSessionRegistry:
-    domain_data = hass.data.setdefault(DOMAIN, {})
-    registry = domain_data.get(DATA_SESSION_REGISTRY)
-    if registry is None:
-        registry = CloudSessionRegistry(async_get_clientsession(hass))
-        domain_data[DATA_SESSION_REGISTRY] = registry
-    return registry
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up one account entry containing one or more appliances."""
-    registry = _registry(hass)
+    registry = get_session_registry(hass)
     account = entry.data[CONF_USERNAME]
     cloud_name = entry.data[CONF_CLOUD]
 

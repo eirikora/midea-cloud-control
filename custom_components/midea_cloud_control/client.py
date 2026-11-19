@@ -25,6 +25,8 @@ _TRANSIENT_ERROR_CODES = frozenset({9999})
 _INVALID_AUTH_CODES = frozenset({3101, 3102, 3301})
 _DEFAULT_MAX_CONCURRENT_REQUESTS = 2
 _DEFAULT_MIN_REQUEST_INTERVAL = 0.75
+_APPLIANCE_LIST_ENDPOINT = "/v1/appliance/user/list/get"
+_SN8_MIN_SERIAL_LENGTH = 17
 
 _CARRIED_STATE = (
     "power_on",
@@ -229,8 +231,59 @@ class MideaCloudClient:
 
     async def list_appliances(self) -> dict[int, dict[str, Any]]:
         """List all appliances visible to the shared account."""
-        result = await self._execute(lambda cloud: cloud.list_appliances(None))
+        result = await self._execute(self._list_appliances)
         return result or {}
+
+    async def _list_appliances(
+        self, cloud: Any
+    ) -> dict[int, dict[str, Any]] | None:
+        """List Midea Air appliances while surfacing session error codes.
+
+        midea-local's public ``list_appliances`` does not enable
+        ``raise_for_error``, so 3106/3144 become an indistinguishable ``None``.
+        The integration is pinned to midea-local 12.2.0 and already relies on
+        these private methods for transparent-send.
+        """
+        if not hasattr(cloud, "_make_general_data") or not hasattr(
+            cloud, "_api_request"
+        ):
+            # Test doubles and future compatible adapters may only expose the
+            # public API. Production MideaAirCloud follows the branch below.
+            return await cloud.list_appliances(None)
+
+        response = await cloud._api_request(
+            endpoint=_APPLIANCE_LIST_ENDPOINT,
+            data=cloud._make_general_data(),
+            raise_for_error=True,
+        )
+        if response is None:
+            return None
+
+        appliances: dict[int, dict[str, Any]] = {}
+        for appliance in response["list"]:
+            try:
+                model_number = int(appliance.get("modelNumber", 0))
+            except ValueError:
+                model_number = 0
+            device_info: dict[str, Any] = {
+                "name": appliance.get("name"),
+                "type": int(appliance.get("type"), 16),
+                "sn": appliance.get("sn"),
+                "sn8": "",
+                "model_number": model_number,
+                "manufacturer_code": appliance.get("enterpriseCode", "0000"),
+                "model": "",
+                "online": appliance.get("onlineStatus") == "1",
+            }
+            serial_number = device_info.get("sn")
+            device_info["sn8"] = (
+                serial_number[9:17]
+                if serial_number and len(serial_number) > _SN8_MIN_SERIAL_LENGTH
+                else ""
+            )
+            device_info["model"] = device_info["sn8"]
+            appliances[int(appliance["id"])] = device_info
+        return appliances
 
     async def query(self, appliance_id: int) -> StateResponse:
         """Read current state of one appliance."""

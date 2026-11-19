@@ -42,6 +42,9 @@ reauth kan gjenbruk av et objekt med gammel `sessionId` forverre feilen.
 ## Implementert løsning
 
 - Ett delt klientobjekt per `(cloud, normalisert konto)` med referansetelling.
+- Options flow bruker en midlertidig registry-lease. En deaktivert oppføring
+  gjenbruker dermed en aktiv kontoøkt som andre oppføringer holder, og åpning av
+  **Configure** utfører ikke ny login når sesjonen fortsatt er gyldig.
 - Login-lås slik at parallelle oppsett bare utfører én reell innlogging.
 - Nytt `MideaAirCloud`-objekt ved reauth; én kontrollert fornyelse per request.
 - Maksimalt tre loginforsøk, to ytre requestforsøk, eksponentiell backoff med
