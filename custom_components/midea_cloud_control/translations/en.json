@@ -8,13 +8,18 @@
           "username": "Email address",
           "password": "Password",
           "cloud": "App / cloud",
-          "scan_interval": "Base polling interval (seconds)"
+          "scan_interval": "Polling interval (seconds)"
         }
       },
       "appliances": {
         "title": "Select appliances",
         "description": "All selected appliances share one authenticated cloud session.",
         "data": { "appliances": "Appliances" }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Midea Cloud Control",
+        "description": "Enter the updated password. It will be applied to every entry sharing this cloud account.",
+        "data": { "password": "Password" }
       }
     },
     "error": {
@@ -25,7 +30,8 @@
       "unknown": "Unexpected error. Check the Home Assistant logs."
     },
     "abort": {
-      "already_configured": "This cloud account is already configured."
+      "already_configured": "This cloud account is already configured.",
+      "reauth_successful": "The cloud account was reauthenticated successfully."
     }
   },
   "options": {
@@ -35,7 +41,7 @@
         "description": "Select the appliances that share this account session and adjust polling.",
         "data": {
           "appliances": "Appliances",
-          "scan_interval": "Base polling interval (seconds)"
+          "scan_interval": "Polling interval (seconds)"
         }
       }
     },

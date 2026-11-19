@@ -22,6 +22,7 @@ import logging
 from typing import Any
 
 from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +33,10 @@ _PACKET_HEADER = [
 ]
 _TRAILER_LEN = 16
 _ENDPOINT = "/v1/appliance/transparent/send"
+
+
+class TransparentSendDecodeError(Exception):
+    """Raised when an encrypted or relayed cloud response cannot be decoded."""
 
 
 def _pad(text: str) -> str:
@@ -51,9 +56,15 @@ def aes_encrypt(text: str, key: str) -> str:
 
 
 def aes_decrypt(payload: str, key: str) -> str:
-    cipher = AES.new(key.encode(), AES.MODE_ECB)
-    raw = cipher.decrypt(binascii.unhexlify(payload)).decode(errors="ignore")
-    return raw[:len(raw) - ord(raw[-1])] if raw else raw
+    """Decrypt and strictly validate PKCS#7 padding."""
+    try:
+        cipher = AES.new(key.encode(), AES.MODE_ECB)
+        raw = cipher.decrypt(binascii.unhexlify(payload))
+        return unpad(raw, AES.block_size).decode()
+    except (binascii.Error, UnicodeDecodeError, ValueError) as err:
+        raise TransparentSendDecodeError(
+            "Invalid encrypted cloud response"
+        ) from err
 
 
 def derive_data_key(access_token: str, app_key: str) -> str:
@@ -85,11 +96,17 @@ def unwrap_reply(reply: str) -> bytes:
 async def transparent_send(cloud: Any, appliance_id: int, frame: bytes,
                            app_key: str) -> bytes | None:
     """Relay `frame` to `appliance_id` through the cloud and return its reply."""
-    data_key = derive_data_key(cloud._access_token, app_key)
+    try:
+        data_key = derive_data_key(cloud._access_token, app_key)
+        encrypted_order = aes_encrypt(wrap_frame(frame), data_key)
+    except (AttributeError, TypeError, ValueError, TransparentSendDecodeError) as err:
+        raise TransparentSendDecodeError(
+            "Could not encode transparent-send request"
+        ) from err
 
     data = cloud._make_general_data()
     data.update({
-        "order": aes_encrypt(wrap_frame(frame), data_key),
+        "order": encrypted_order,
         "funId": "0000",
         "applianceId": str(appliance_id),
     })
@@ -100,7 +117,12 @@ async def transparent_send(cloud: Any, appliance_id: int, frame: bytes,
         endpoint=_ENDPOINT, data=data, raise_for_error=True
     )
     if not response or "reply" not in response:
-        _LOGGER.warning("transparent_send: no reply for appliance %s", appliance_id)
+        _LOGGER.debug("transparent_send: no reply for appliance %s", appliance_id)
         return None
 
-    return unwrap_reply(aes_decrypt(response["reply"], data_key))
+    try:
+        return unwrap_reply(aes_decrypt(response["reply"], data_key))
+    except (TypeError, ValueError, TransparentSendDecodeError) as err:
+        raise TransparentSendDecodeError(
+            "Could not decode transparent-send reply"
+        ) from err

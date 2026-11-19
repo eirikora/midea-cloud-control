@@ -128,6 +128,18 @@ class CloudSessionRegistry:
             record = self._records.get(self.key(cloud_name, account))
             return record.references if record else 0
 
+    async def update_credentials(
+        self, account: str, password: str, cloud_name: str
+    ) -> None:
+        """Update an active shared record after successful reauthentication."""
+        digest = hashlib.sha256(password.encode()).digest()
+        async with self._lock:
+            record = self._records.get(self.key(cloud_name, account))
+            if record is None:
+                return
+            record.password_digest = digest
+            await record.client.update_password(password)
+
 
 def get_session_registry(hass: HomeAssistant) -> CloudSessionRegistry:
     """Return the one central cloud-session registry for Home Assistant."""

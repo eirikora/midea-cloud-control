@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Mapping
 from typing import Any
 
 import voluptuous as vol
 from homeassistant.config_entries import (
     ConfigEntry,
+    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
     OptionsFlow,
@@ -30,6 +32,7 @@ from .const import (
     CONF_APPLIANCES,
     CONF_CLOUD,
     CONF_SCAN_INTERVAL,
+    CONFIG_ENTRY_VERSION,
     DEFAULT_SCAN_INTERVAL_SECONDS,
     DOMAIN,
     MAX_SCAN_INTERVAL_SECONDS,
@@ -69,7 +72,7 @@ def account_unique_id(cloud_name: str, account: str) -> str:
 class MideaCloudConfigFlow(ConfigFlow, domain=DOMAIN):
     """Configure one cloud account with multiple appliance entities."""
 
-    VERSION = 2
+    VERSION = CONFIG_ENTRY_VERSION
 
     def __init__(self) -> None:
         self._credentials: dict[str, Any] = {}
@@ -133,6 +136,78 @@ class MideaCloudConfigFlow(ConfigFlow, domain=DOMAIN):
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_SCHEMA, errors=errors
         )
+
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
+        """Start reauthentication after credentials are rejected."""
+        del entry_data
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Validate and replace the password for every entry sharing the account."""
+        reauth_entry = self._get_reauth_entry()
+        errors: dict[str, str] = {}
+        if user_input is not None:
+            password = user_input[CONF_PASSWORD]
+            client = MideaCloudClient(
+                reauth_entry.data[CONF_USERNAME],
+                password,
+                reauth_entry.data[CONF_CLOUD],
+                session=async_get_clientsession(self.hass),
+            )
+            try:
+                await client.connect()
+            except CloudInvalidAuthError:
+                errors["base"] = "invalid_auth"
+            except CloudError:
+                errors["base"] = "cannot_connect"
+            except Exception:
+                _LOGGER.exception("Unexpected error reauthenticating Midea cloud")
+                errors["base"] = "unknown"
+            finally:
+                await client.close()
+
+            if not errors:
+                account = normalize_account(reauth_entry.data[CONF_USERNAME])
+                cloud_name = reauth_entry.data[CONF_CLOUD]
+                registry = get_session_registry(self.hass)
+                await registry.update_credentials(
+                    reauth_entry.data[CONF_USERNAME], password, cloud_name
+                )
+                for entry in self._async_current_entries():
+                    if (
+                        entry.data.get(CONF_CLOUD) == cloud_name
+                        and normalize_account(entry.data.get(CONF_USERNAME, ""))
+                        == account
+                        and entry.entry_id != reauth_entry.entry_id
+                    ):
+                        self._async_apply_password(entry, password)
+                self._async_apply_password(reauth_entry, password)
+                return self.async_abort(reason="reauth_successful")
+
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
+            errors=errors,
+        )
+
+    @callback
+    def _async_apply_password(self, entry: ConfigEntry, password: str) -> None:
+        """Store a new password and reload the entry exactly once.
+
+        A loaded entry has an update listener that reloads it when its data
+        changes, so scheduling another reload would reload it twice. Entries
+        that are not loaded (for example SETUP_ERROR after rejected
+        credentials) have no listener and must be reloaded explicitly.
+        """
+        changed = self.hass.config_entries.async_update_entry(
+            entry, data={**entry.data, CONF_PASSWORD: password}
+        )
+        if entry.state is not ConfigEntryState.LOADED or not changed:
+            self.hass.config_entries.async_schedule_reload(entry.entry_id)
 
     async def async_step_appliances(
         self, user_input: dict[str, Any] | None = None

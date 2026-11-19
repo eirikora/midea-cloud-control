@@ -5,8 +5,8 @@
 Utgangspunktet er upstream-commit `4e29c35`.
 
 1. `async_setup_entry()` opprettet en ny `MideaCloudClient` og kalte `login()`
-   for hver config entry. Med 15 enhetsoppføringer ga dette 15 separate
-   innlogginger og 15 uavhengige sesjoner for samme konto.
+   for hver config entry. Med 16 enhetsoppføringer ga dette 16 separate
+   innlogginger og 16 uavhengige sesjoner for samme konto.
 2. Hver coordinator pollet hvert 30. sekund. Det fantes ingen felles kø,
    samtidighetsgrense, ratebegrensning eller spredning mellom enhetene.
 3. `transparent_send()` kalte den private `midea-local`-metoden `_api_request()`
@@ -24,7 +24,7 @@ Utgangspunktet er upstream-commit `4e29c35`.
    kort backoff før det returnerer tomt svar.
 6. Biblioteket har en intern `_api_lock` per skyobjekt, men den opprinnelige
    integrasjonen opprettet ett skyobjekt per enhet. Låsen ga derfor ingen felles
-   begrensning på tvers av de 15 oppføringene.
+   begrensning på tvers av de 16 oppføringene.
 
 ## Rotårsak og usikkerhet
 
@@ -35,7 +35,7 @@ for innloggingsgrense, men beviser ikke terskelen eller om 3106 skyldtes akkurat
 den grensen.
 
 Det som er sikkert, er at gammel arkitektur forsterket enhver slik begrensning:
-15 innlogginger under oppstart, ingen koordinert fornyelse og synkrone 30-sekunds
+16 innlogginger under oppstart, ingen koordinert fornyelse og synkrone 30-sekunds
 pollinger. `3144` kan skyldes server-side login-state/ratebegrensning, og ved
 reauth kan gjenbruk av et objekt med gammel `sessionId` forverre feilen.
 
@@ -49,8 +49,13 @@ reauth kan gjenbruk av et objekt med gammel `sessionId` forverre feilen.
 - Nytt `MideaAirCloud`-objekt ved reauth; én kontrollert fornyelse per request.
 - Maksimalt tre loginforsøk, to ytre requestforsøk, eksponentiell backoff med
   jitter og 60 sekunders cooldown etter uttømte loginforsøk.
-- Felles semaphore (2) og minimum 0,75 sekunder mellom request-starter.
-- 90 sekunders standardpolling, deterministisk spredt opp til 120 sekunder.
+- Felles semaphore (1), i tråd med midea-local sin serialiserte `_api_lock`, og
+  minimum 0,75 sekunder mellom request-starter.
+- 105 sekunders standardpolling med ett felles intervall og en round-robin-
+  planlegger som fordeler enhetene jevnt over intervallet. Migrerte
+  enkeltoppføringer får en deterministisk fase fra appliance-ID-en. Migrering
+  fra schema 2 endrer den gamle 90-sekunders grunnverdien til 105 sekunder for
+  å bevare omtrent samme kallrate som den tidligere 90–120-sekunders spredningen.
 - Konto-basert config entry med flere climate-entiteter og passord lagret én
   gang for nye oppsett.
 - Forsiktig v1-migrering som beholder appliance-ID som entity unique ID. Gamle
@@ -79,8 +84,9 @@ stedet for å kaste `MideaCloudError`. `transparent_send()` kan dermed ikke se
 feilkoden og returnerer også `None`.
 
 For statuslesing behandles et slikt tomt svar som transient. Statuskall er
-idempotente og kan gjentas opptil tre ganger med eksponentiell backoff og jitter.
-3176 utløser ikke login eller sesjonsfornyelse.
+idempotente og kan gjentas én gang etter 3–5 sekunder. Siste kjente tilstand
+beholdes gjennom to påfølgende forbigående pollfeil. 3176 utløser ikke login
+eller sesjonsfornyelse.
 
 For styringskommandoer er tomt svar tvetydig: skyen kan ha sendt kommandoen til
 anlegget før det asynkrone svaret forsvant. Integrasjonen sender derfor aldri

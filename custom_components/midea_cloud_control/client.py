@@ -14,9 +14,16 @@ from typing import Any, TypeVar
 import aiohttp
 from midealocal.cloud import SUPPORTED_CLOUDS, get_midea_cloud
 from midealocal.exceptions import MideaCloudError
-from msmart.device.AC.command import GetStateCommand, Response, SetStateCommand, StateResponse
+from msmart.device.AC.command import (
+    GetStateCommand,
+    InvalidResponseException,
+    Response,
+    SetStateCommand,
+    StateResponse,
+)
+from msmart.frame import InvalidFrameException
 
-from .protocol import transparent_send
+from .protocol import TransparentSendDecodeError, transparent_send
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,7 +32,7 @@ _SESSION_ERROR_CODES = frozenset({3106, 3144})
 _LOGIN_TRANSIENT_ERROR_CODES = frozenset({9999})
 _REQUEST_TRANSIENT_ERROR_CODES = frozenset({3176, 9999})
 _INVALID_AUTH_CODES = frozenset({3101, 3102, 3301})
-_DEFAULT_MAX_CONCURRENT_REQUESTS = 2
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 1
 _DEFAULT_MIN_REQUEST_INTERVAL = 0.75
 _APPLIANCE_LIST_ENDPOINT = "/v1/appliance/user/list/get"
 _SN8_MIN_SERIAL_LENGTH = 17
@@ -91,12 +98,29 @@ class RetryPolicy:
     # midea-local already retries each HTTP call up to three times. Two outer
     # attempts keep recovery bounded while still handling an empty response.
     request_attempts: int = 2
-    status_attempts: int = 3
+    status_attempts: int = 2
     command_verification_attempts: int = 2
+    status_retry_delay: float = 3.0
+    status_retry_jitter: float = 2.0
     base_delay: float = 1.0
     maximum_delay: float = 30.0
     jitter: float = 0.25
     cooldown: float = 60.0
+
+
+@dataclass(slots=True)
+class ApplianceMetrics:
+    """Non-sensitive runtime counters for one appliance."""
+
+    status_requests: int = 0
+    status_attempts: int = 0
+    command_requests: int = 0
+    command_attempts: int = 0
+    missing_replies: int = 0
+    protocol_errors: int = 0
+    total_status_seconds: float = 0.0
+    last_status_seconds: float | None = None
+    online: bool | None = None
 
 
 class MideaCloudClient:
@@ -134,6 +158,7 @@ class MideaCloudClient:
         self._session = session
         self._owns_session = session is None
         self._cloud_factory = cloud_factory
+        self._validate_private_api = cloud_factory is get_midea_cloud
         self._cloud: Any = None
 
         self._policy = retry_policy or RetryPolicy()
@@ -144,6 +169,7 @@ class MideaCloudClient:
         self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
         self._rate_lock = asyncio.Lock()
         self._device_locks: dict[int, asyncio.Lock] = {}
+        self._metrics: dict[int, ApplianceMetrics] = {}
         self._min_request_interval = min_request_interval
         self._next_request_at = 0.0
         self._generation = 0
@@ -186,6 +212,8 @@ class MideaCloudClient:
             candidate = self._cloud_factory(
                 self._cloud_name, self._session, self._account, self._password
             )
+            if self._validate_private_api:
+                self._validate_cloud_private_api(candidate)
             try:
                 logged_in = await candidate.login()
             except MideaCloudError as err:
@@ -237,10 +265,22 @@ class MideaCloudClient:
                 await self._session.close()
                 self._session = None
 
+    async def update_password(self, password: str) -> None:
+        """Replace credentials and invalidate authentication without logging in."""
+        async with self._auth_lock:
+            self._password = password
+            self._cloud = None
+            self._cooldown_until = 0.0
+
     async def list_appliances(self) -> dict[int, dict[str, Any]]:
         """List all appliances visible to the shared account."""
         result = await self._execute(self._list_appliances)
-        return result or {}
+        appliances = result or {}
+        for appliance_id, appliance in appliances.items():
+            self._metrics.setdefault(appliance_id, ApplianceMetrics()).online = (
+                appliance.get("online")
+            )
+        return appliances
 
     async def _list_appliances(
         self, cloud: Any
@@ -294,7 +334,18 @@ class MideaCloudClient:
         return appliances
 
     async def query(self, appliance_id: int) -> StateResponse:
-        """Read current state of one appliance."""
+        """Read current state while serializing against commands for the device."""
+        device_lock = self._device_locks.setdefault(appliance_id, asyncio.Lock())
+        async with device_lock:
+            return await self._query(appliance_id)
+
+    async def _query(
+        self, appliance_id: int, *, max_attempts: int | None = None
+    ) -> StateResponse:
+        """Read current state; the caller must hold the per-device lock."""
+        metrics = self._metrics.setdefault(appliance_id, ApplianceMetrics())
+        metrics.status_requests += 1
+        started = self._monotonic()
 
         async def operation(cloud: Any) -> StateResponse:
             reply = await transparent_send(
@@ -302,19 +353,27 @@ class MideaCloudClient:
             )
             if reply is None:
                 raise _TransientRequestError("Cloud returned no appliance reply")
-            try:
-                response = Response.construct(reply)
-            except (ValueError, IndexError) as err:
-                raise CloudProtocolError("Could not decode appliance response") from err
-            if not isinstance(response, StateResponse):
-                raise CloudProtocolError(
-                    f"Unexpected appliance response type {type(response).__name__}"
-                )
-            return response
+            return self._decode_state_response(reply, "appliance")
 
-        return await self._execute(
-            operation, max_attempts=self._policy.status_attempts
-        )
+        try:
+            state = await self._execute(
+                operation,
+                max_attempts=(
+                    max_attempts
+                    if max_attempts is not None
+                    else self._policy.status_attempts
+                ),
+                retry_protocol=True,
+                transient_backoff=self._status_backoff,
+                metrics=metrics,
+                operation_kind="status",
+            )
+            metrics.online = True
+            return state
+        finally:
+            elapsed = max(0.0, self._monotonic() - started)
+            metrics.last_status_seconds = elapsed
+            metrics.total_status_seconds += elapsed
 
     async def set_state(
         self, appliance_id: int, *, beep: bool = False, **changes: Any
@@ -326,7 +385,9 @@ class MideaCloudClient:
 
         device_lock = self._device_locks.setdefault(appliance_id, asyncio.Lock())
         async with device_lock:
-            current = await self.query(appliance_id)
+            metrics = self._metrics.setdefault(appliance_id, ApplianceMetrics())
+            metrics.command_requests += 1
+            current = await self._query(appliance_id)
             command = SetStateCommand()
             command.beep_on = beep
             for field in _CARRIED_STATE:
@@ -335,23 +396,32 @@ class MideaCloudClient:
                 setattr(command, field, value)
 
             async def operation(cloud: Any) -> StateResponse:
-                reply = await transparent_send(
-                    cloud, appliance_id, command.tobytes(), self._app_key
-                )
+                try:
+                    reply = await transparent_send(
+                        cloud, appliance_id, command.tobytes(), self._app_key
+                    )
+                except TransparentSendDecodeError as err:
+                    metrics.protocol_errors += 1
+                    raise CloudCommandUncertainError(
+                        "Cloud command reply could not be decoded"
+                    ) from err
                 if reply is None:
                     raise _TransientRequestError("Cloud did not acknowledge command")
                 try:
-                    response = Response.construct(reply)
-                except (ValueError, IndexError) as err:
-                    raise CloudProtocolError("Could not decode command response") from err
-                if not isinstance(response, StateResponse):
-                    raise CloudProtocolError(
-                        f"Unexpected command response type {type(response).__name__}"
-                    )
-                return response
+                    return self._decode_state_response(reply, "command")
+                except CloudProtocolError as err:
+                    metrics.protocol_errors += 1
+                    raise CloudCommandUncertainError(
+                        "Cloud command reply could not be decoded"
+                    ) from err
 
             try:
-                return await self._execute(operation, retry_transient=False)
+                return await self._execute(
+                    operation,
+                    retry_transient=False,
+                    metrics=metrics,
+                    operation_kind="command",
+                )
             except CloudCommandUncertainError as err:
                 return await self._verify_uncertain_command(
                     appliance_id, changes, err
@@ -363,12 +433,24 @@ class MideaCloudClient:
         *,
         max_attempts: int | None = None,
         retry_transient: bool = True,
+        retry_protocol: bool = False,
+        transient_backoff: Callable[[int], Awaitable[None]] | None = None,
+        metrics: ApplianceMetrics | None = None,
+        operation_kind: str | None = None,
     ) -> _T:
         last_error: Exception | None = None
         session_refreshes = 0
-        attempts = max_attempts or self._policy.request_attempts
+        protocol_retries = 0
+        attempts = (
+            max_attempts if max_attempts is not None else self._policy.request_attempts
+        )
 
         for attempt in range(attempts):
+            if metrics is not None:
+                if operation_kind == "status":
+                    metrics.status_attempts += 1
+                elif operation_kind == "command":
+                    metrics.command_attempts += 1
             await self.connect()
             cloud = self._cloud
             generation = self._generation
@@ -391,8 +473,24 @@ class MideaCloudClient:
                         f"Cloud request was rejected with code {err.code}"
                     ) from err
                 last_error = err
+                if metrics is not None and err.code == 3176:
+                    metrics.missing_replies += 1
             except (_TransientRequestError, aiohttp.ClientError, TimeoutError, OSError) as err:
                 last_error = err
+                if metrics is not None and isinstance(err, _TransientRequestError):
+                    metrics.missing_replies += 1
+            except (CloudProtocolError, TransparentSendDecodeError) as err:
+                if metrics is not None:
+                    metrics.protocol_errors += 1
+                protocol_error = (
+                    err
+                    if isinstance(err, CloudProtocolError)
+                    else CloudProtocolError("Could not decode appliance response")
+                )
+                if not retry_protocol or protocol_retries >= 1:
+                    raise protocol_error from err
+                protocol_retries += 1
+                last_error = protocol_error
 
             if not retry_transient:
                 raise CloudCommandUncertainError(
@@ -400,7 +498,7 @@ class MideaCloudClient:
                 ) from last_error
 
             if attempt < attempts - 1:
-                await self._backoff(attempt)
+                await (transient_backoff or self._backoff)(attempt)
 
         raise CloudUnavailableError(
             f"Cloud request failed after {attempts} attempts"
@@ -417,7 +515,7 @@ class MideaCloudClient:
         for attempt in range(self._policy.command_verification_attempts):
             await self._backoff(attempt)
             try:
-                state = await self.query(appliance_id)
+                state = await self._query(appliance_id, max_attempts=1)
             except CloudError as err:
                 last_query_error = err
                 continue
@@ -450,6 +548,55 @@ class MideaCloudClient:
                 return False
         return True
 
+    def appliance_diagnostics(self, appliance_id: int) -> dict[str, Any]:
+        """Return non-sensitive counters for Home Assistant diagnostics."""
+        metrics = self._metrics.get(appliance_id, ApplianceMetrics())
+        average = (
+            metrics.total_status_seconds / metrics.status_requests
+            if metrics.status_requests
+            else None
+        )
+        return {
+            "status_requests": metrics.status_requests,
+            "status_attempts": metrics.status_attempts,
+            "command_requests": metrics.command_requests,
+            "command_attempts": metrics.command_attempts,
+            "missing_replies": metrics.missing_replies,
+            "protocol_errors": metrics.protocol_errors,
+            "online": metrics.online,
+            "average_status_seconds": average,
+            "last_status_seconds": metrics.last_status_seconds,
+        }
+
+    @staticmethod
+    def _decode_state_response(reply: bytes, context: str) -> StateResponse:
+        """Decode an msmart state response into a controlled cloud error."""
+        try:
+            response = Response.construct(reply)
+        except (
+            IndexError,
+            InvalidFrameException,
+            InvalidResponseException,
+            ValueError,
+        ) as err:
+            raise CloudProtocolError(f"Could not decode {context} response") from err
+        if not isinstance(response, StateResponse):
+            raise CloudProtocolError(
+                f"Unexpected {context} response type {type(response).__name__}"
+            )
+        return response
+
+    @staticmethod
+    def _validate_cloud_private_api(cloud: Any) -> None:
+        """Fail clearly if pinned midea-local internals are no longer available."""
+        required = ("_access_token", "_api_request", "_make_general_data")
+        missing = [name for name in required if not hasattr(cloud, name)]
+        if missing:
+            raise CloudProtocolError(
+                "Installed midea-local is incompatible; missing private API: "
+                + ", ".join(missing)
+            )
+
     async def _refresh_if_current(self, failed_generation: int) -> None:
         """Refresh once when concurrent requests observe the same expired session."""
         async with self._auth_lock:
@@ -474,3 +621,9 @@ class MideaCloudClient:
         )
         jitter = base * self._policy.jitter * self._random()
         await self._sleep(base + jitter)
+
+    async def _status_backoff(self, attempt: int) -> None:
+        """Pause long enough for other devices to use the account queue."""
+        delay = self._policy.status_retry_delay * (2**attempt)
+        jitter = self._policy.status_retry_jitter * self._random()
+        await self._sleep(delay + jitter)

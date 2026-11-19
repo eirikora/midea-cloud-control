@@ -37,7 +37,7 @@ Home Assistant cannot connect.
 This is cloud control. Be clear-eyed about what that means:
 
 - Requires internet access and Midea's servers being up.
-- State is **polled** (90 s base interval, spread up to 120 s), not pushed.
+- State is **polled** (105 s default, configurable to 60–120 s), not pushed.
 - ~1 s round trip per command, versus near-instant local control.
 - Midea is retiring these APIs progressively; `transparent/send` could follow
   `getToken`.
@@ -69,7 +69,7 @@ selected appliance.
 | | |
 |---|---|
 | HVAC modes | off, auto, cool, dry, heat, fan only |
-| Target temperature | 17–30 °C, 0.5 °C steps |
+| Target temperature | 16–30 °C, 0.5 °C steps |
 | Current temperature | indoor sensor |
 | Fan | silent, low, medium, high, max, auto |
 | Swing | off, horizontal, vertical, both |
@@ -114,24 +114,38 @@ otherwise the padding is read as payload and fails CRC.
 - Session errors 3106 and 3144 replace the complete `MideaAirCloud` object
   before a bounded reauthentication attempt. This avoids carrying an expired
   `sessionId` into login.
-- Requests share a semaphore and a minimum start interval. Initial refreshes are
-  queued centrally and coordinator intervals are deterministically spread.
+- Requests share a single-slot semaphore and a minimum start interval, matching
+  midea-local's serialized account lock. A round-robin scheduler gives every
+  appliance a stable phase within the common interval instead of sending a
+  periodic burst. Migrated single-appliance entries derive a deterministic
+  phase from the appliance ID.
 - Error 9999 and empty/network responses use bounded retries with exponential
   backoff and jitter. Repeated login failures enter a cooldown.
 - NetHome Plus error 3176 (missing asynchronous reply) is treated as transient
-  for idempotent status reads, without reauthentication. Commands are never
+  for idempotent status reads, with two attempts separated by 3–5 seconds and
+  without reauthentication. Short transient outages retain the last known
+  state for up to two polls. Commands are never
   blindly replayed after a missing acknowledgement; the requested fields are
   verified through status reads and an unverified result remains an error.
-- Config entry version 2 represents an account containing multiple appliances.
+- Home Assistant diagnostics expose non-sensitive request counters, response
+  timing, last successful update, last known online status, and protocol errors.
+- Reauthentication updates every entry sharing the same account while retaining
+  appliance-based entity unique IDs.
+- Config entry version 3 represents an account containing multiple appliances
+  and a fixed account-wide polling interval.
   Climate unique IDs remain the appliance IDs, preserving existing entity IDs
   where Home Assistant's entity registry permits it.
 
-Version-1 entries migrate safely to version 2 as one-appliance account entries.
+Version-1 entries migrate safely to version 3 as one-appliance account entries.
 They share a runtime session immediately, but are not automatically merged
 because deleting or merging config entries during startup could lose entity
 registry associations. Use **Configure** on one migrated entry to select all
 appliances, validate the entity mapping, and only then remove the other disabled
 legacy entries.
+
+Version-2 entries using the former 90-second base interval migrate to a fixed
+105-second interval. This preserves approximately the same request rate as the
+old 90–120-second per-device spread.
 
 The transparent-send transport necessarily uses private `midea-local` members
 (`_access_token`, `_make_general_data`, and `_api_request`). The manifest pins
@@ -149,9 +163,10 @@ python3.13 -m venv .venv
 ```
 
 Tests use scripted cloud objects only. They do not require credentials, contact
-Midea, or send appliance commands. Covered cases include 1/15-device session
-sharing, concurrent login, 3106/3144/9999 handling, network recovery, reference
-counting, request concurrency, and device-targeted temperature changes.
+Midea, or send appliance commands. Covered cases include 1/16-device session
+sharing, concurrent login, 3106/3144/3176/9999 handling, stale-state recovery,
+reauthentication, reference counting, corrupt replies, command verification,
+and stable appliance-based entity IDs.
 
 See [the technical analysis](docs/ANALYSIS.md) and the
 [don-aurora deployment and rollback runbook](docs/DEPLOYMENT_DON_AURORA.md).

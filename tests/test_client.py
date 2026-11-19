@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import aiohttp
 import pytest
 from midealocal.exceptions import MideaCloudError
+from msmart.frame import InvalidFrameException
 
 from custom_components.midea_cloud_control import client as client_module
 from custom_components.midea_cloud_control.client import (
@@ -223,7 +224,9 @@ async def test_3176_none_during_polling_is_retried_without_login(
 
     client = make_client(
         lambda *_args: cloud,
-        policy=RetryPolicy(status_attempts=3, base_delay=1, jitter=0),
+        policy=RetryPolicy(
+            status_attempts=2, status_retry_delay=3, status_retry_jitter=0
+        ),
         sleep=record_sleep,
     )
     await client.connect()
@@ -247,9 +250,13 @@ async def test_3176_none_during_polling_is_retried_without_login(
 
     assert isinstance(await client.query(123), FakeState)
     assert send_calls == 2
-    assert sleeps == [1]
+    assert sleeps == [3]
     assert cloud.login_calls == 1
     assert client.generation == 1
+    diagnostics = client.appliance_diagnostics(123)
+    assert diagnostics["missing_replies"] == 1
+    assert diagnostics["status_attempts"] == 2
+    assert diagnostics["online"] is True
 
 
 @pytest.mark.asyncio
@@ -265,7 +272,9 @@ async def test_persistent_3176_polling_is_reported_without_login(
 
     client = make_client(
         lambda *_args: cloud,
-        policy=RetryPolicy(status_attempts=3, base_delay=1, jitter=0),
+        policy=RetryPolicy(
+            status_attempts=2, status_retry_delay=3, status_retry_jitter=0
+        ),
         sleep=record_sleep,
     )
 
@@ -278,10 +287,42 @@ async def test_persistent_3176_polling_is_reported_without_login(
 
     with pytest.raises(CloudUnavailableError):
         await client.query(123)
-    assert send_calls == 3
-    assert sleeps == [1, 2]
+    assert send_calls == 2
+    assert sleeps == [3]
     assert cloud.login_calls == 1
     assert client.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_invalid_status_frame_is_retried_once_then_controlled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud = FakeCloud()
+    sleeps: list[float] = []
+    client = make_client(
+        lambda *_args: cloud,
+        policy=RetryPolicy(status_retry_delay=3, status_retry_jitter=0),
+        sleep=lambda delay: _record_delay(sleeps, delay),
+    )
+    send_calls = 0
+
+    async def fake_send(*_args: object) -> bytes:
+        nonlocal send_calls
+        send_calls += 1
+        return b"corrupt"
+
+    class InvalidResponse:
+        @staticmethod
+        def construct(_reply: bytes) -> object:
+            raise InvalidFrameException("bad checksum")
+
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+    monkeypatch.setattr(client_module, "Response", InvalidResponse)
+
+    with pytest.raises(client_module.CloudProtocolError):
+        await client.query(123)
+    assert send_calls == 2
+    assert sleeps == [3]
 
 
 @pytest.mark.asyncio
@@ -302,12 +343,17 @@ async def test_network_recovers_on_next_poll() -> None:
     assert cloud.login_calls == 1
 
 
+def test_private_cloud_api_incompatibility_is_reported_clearly() -> None:
+    with pytest.raises(client_module.CloudProtocolError, match="_access_token"):
+        MideaCloudClient._validate_cloud_private_api(SimpleNamespace())
+
+
 @pytest.mark.asyncio
-async def test_fifteen_requests_obey_shared_concurrency_limit() -> None:
+async def test_sixteen_requests_obey_shared_concurrency_limit() -> None:
     cloud = FakeCloud(responses=[{1: {}}], delay=0.01)
     client = make_client(lambda *_args: cloud, max_concurrent_requests=2)
 
-    await asyncio.gather(*(client.list_appliances() for _ in range(15)))
+    await asyncio.gather(*(client.list_appliances() for _ in range(16)))
 
     assert cloud.max_active == 2
     assert cloud.login_calls == 1
@@ -325,7 +371,7 @@ async def test_temperature_change_targets_only_requested_appliance(
         **{field: False for field in client_module._CARRIED_STATE}
     )
     current.target_temperature = 21.0
-    client.query = AsyncMock(return_value=current)  # type: ignore[method-assign]
+    client._query = AsyncMock(return_value=current)  # type: ignore[method-assign]
 
     sent: list[tuple[int, float]] = []
 
@@ -382,7 +428,9 @@ async def test_3176_command_is_sent_once_then_verified(
         **{field: False for field in client_module._CARRIED_STATE}
     )
     verified.power_on = True
-    client.query = AsyncMock(side_effect=[current, verified])  # type: ignore[method-assign]
+    client._query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[current, verified]
+    )
 
     send_calls = 0
 
@@ -400,7 +448,7 @@ async def test_3176_command_is_sent_once_then_verified(
 
     assert await client.set_state(222, power_on=True) is verified
     assert send_calls == 1
-    assert client.query.await_count == 2
+    assert client._query.await_count == 2
     assert sleeps == [1]
     assert cloud.login_calls == 1
 
@@ -425,7 +473,7 @@ async def test_3176_command_is_never_replayed_when_verification_fails(
     mismatch = SimpleNamespace(
         **{field: False for field in client_module._CARRIED_STATE}
     )
-    client.query = AsyncMock(  # type: ignore[method-assign]
+    client._query = AsyncMock(  # type: ignore[method-assign]
         side_effect=[current, mismatch, mismatch]
     )
 
@@ -446,8 +494,49 @@ async def test_3176_command_is_never_replayed_when_verification_fails(
     with pytest.raises(CloudCommandUncertainError):
         await client.set_state(222, power_on=True)
     assert send_calls == 1
-    assert client.query.await_count == 3
+    assert client._query.await_count == 3
     assert sleeps == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_corrupt_command_reply_is_sent_once_then_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud = FakeCloud()
+    client = make_client(lambda *_args: cloud)
+    current = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    verified = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    verified.power_on = True
+    client._query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[current, verified]
+    )
+    send_calls = 0
+
+    class FakeCommand:
+        def tobytes(self) -> bytes:
+            return b"command"
+
+    class InvalidResponse:
+        @staticmethod
+        def construct(_reply: bytes) -> object:
+            raise InvalidFrameException("bad checksum")
+
+    async def fake_send(*_args: object) -> bytes:
+        nonlocal send_calls
+        send_calls += 1
+        return b"corrupt"
+
+    monkeypatch.setattr(client_module, "SetStateCommand", FakeCommand)
+    monkeypatch.setattr(client_module, "Response", InvalidResponse)
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+
+    assert await client.set_state(222, power_on=True) is verified
+    assert send_calls == 1
+    assert client.appliance_diagnostics(222)["protocol_errors"] == 1
 
 
 async def _record_delay(delays: list[float], delay: float) -> None:

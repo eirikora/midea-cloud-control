@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import ClassVar
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -43,19 +44,19 @@ async def test_one_device_uses_one_session() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fifteen_devices_share_one_session() -> None:
+async def test_sixteen_devices_share_one_session() -> None:
     registry = CloudSessionRegistry(object(), client_factory=FakeClient)  # type: ignore[arg-type]
 
     clients = await asyncio.gather(
         *(
             registry.acquire("User@Example.invalid", "pw", "NetHome Plus")
-            for _ in range(15)
+            for _ in range(16)
         )
     )
 
     assert len(FakeClient.instances) == 1
     assert len({id(client) for client in clients}) == 1
-    assert await registry.references("user@example.invalid", "NetHome Plus") == 15
+    assert await registry.references("user@example.invalid", "NetHome Plus") == 16
 
 
 @pytest.mark.asyncio
@@ -87,3 +88,20 @@ async def test_temporary_lease_preserves_persistent_session() -> None:
 
     assert await registry.references("user@example.invalid", "NetHome Plus") == 1
     assert persistent.close_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_reauth_updates_active_shared_credentials() -> None:
+    registry = CloudSessionRegistry(object(), client_factory=FakeClient)  # type: ignore[arg-type]
+    client = await registry.acquire("user@example.invalid", "old", "NetHome Plus")
+    client.update_password = AsyncMock()  # type: ignore[method-assign]
+
+    await registry.update_credentials(
+        "user@example.invalid", "new", "NetHome Plus"
+    )
+
+    client.update_password.assert_awaited_once_with("new")
+    same_client = await registry.acquire(
+        "user@example.invalid", "new", "NetHome Plus"
+    )
+    assert same_client is client

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from Crypto.Cipher import AES
 from midealocal.cloud import RAISE_FOR_ERROR_CODES, MideaCloud
 from midealocal.exceptions import CLOUD_ERRORS
 
@@ -23,6 +24,32 @@ def test_midea_local_3176_is_logged_but_not_raised() -> None:
         )
         is None
     )
+
+
+def test_aes_decrypt_rejects_invalid_padding() -> None:
+    key = "0123456789abcdef"
+    invalid_block = AES.new(key.encode(), AES.MODE_ECB).encrypt(b"A" * 16).hex()
+
+    with pytest.raises(protocol.TransparentSendDecodeError):
+        protocol.aes_decrypt(invalid_block, key)
+
+
+@pytest.mark.asyncio
+async def test_transparent_send_wraps_invalid_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCloud:
+        _access_token = "token"
+
+        def _make_general_data(self) -> dict[str, object]:
+            return {}
+
+        async def _api_request(self, **_kwargs: object) -> dict[str, str]:
+            return {"reply": "not-hex"}
+
+    monkeypatch.setattr(protocol, "derive_data_key", lambda *_args: "data-key")
+    monkeypatch.setattr(protocol, "aes_encrypt", lambda *_args: "encrypted-order")
+
+    with pytest.raises(protocol.TransparentSendDecodeError):
+        await protocol.transparent_send(FakeCloud(), 123, b"frame", "app-key")
 
 
 @pytest.mark.asyncio

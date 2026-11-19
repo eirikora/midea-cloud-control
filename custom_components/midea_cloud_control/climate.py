@@ -115,6 +115,12 @@ class MideaCloudClimate(CoordinatorEntity[MideaCloudCoordinator], ClimateEntity)
             "sleep": getattr(self._state, "sleep", None),
             "filter_alert": getattr(self._state, "filter_alert", None),
             "error_code": getattr(self._state, "error_code", None),
+            "cloud_last_success": (
+                self.coordinator.last_success_at.isoformat()
+                if self.coordinator.last_success_at is not None
+                else None
+            ),
+            "cloud_consecutive_failures": self.coordinator.consecutive_failures,
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:

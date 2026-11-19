@@ -1,12 +1,12 @@
 {
   "domain": "midea_cloud_control",
   "name": "Midea Cloud Control (Ariston Clima / NetHome Plus)",
-  "codeowners": [],
+  "codeowners": ["@eirikora"],
   "config_flow": true,
-  "documentation": "https://github.com/AndreiVasile96/midea-cloud-control",
+  "documentation": "https://github.com/eirikora/midea-cloud-control",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/AndreiVasile96/midea-cloud-control/issues",
+  "issue_tracker": "https://github.com/eirikora/midea-cloud-control/issues",
   "requirements": ["midea-local==12.2.0", "msmart-ng==2026.11.0", "pycryptodome==3.24.1"],
-  "version": "0.2.2"
+  "version": "0.2.3"
 }
