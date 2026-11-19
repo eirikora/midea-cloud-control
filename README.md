@@ -118,6 +118,10 @@ otherwise the padding is read as payload and fails CRC.
   queued centrally and coordinator intervals are deterministically spread.
 - Error 9999 and empty/network responses use bounded retries with exponential
   backoff and jitter. Repeated login failures enter a cooldown.
+- NetHome Plus error 3176 (missing asynchronous reply) is treated as transient
+  for idempotent status reads, without reauthentication. Commands are never
+  blindly replayed after a missing acknowledgement; the requested fields are
+  verified through status reads and an unverified result remains an error.
 - Config entry version 2 represents an account containing multiple appliances.
   Climate unique IDs remain the appliance IDs, preserving existing entity IDs
   where Home Assistant's entity registry permits it.

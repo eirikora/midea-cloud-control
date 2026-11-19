@@ -68,3 +68,22 @@ reauth kan gjenbruk av et objekt med gammel `sessionId` forverre feilen.
   nettverksforsøk enn integrasjonens teller alene viser.
 - Ingen automatisk test kontakter NetHome Plus. Faktisk skyadferd og kommandoer
   må valideres gradvis i produksjonsmiljøet etter eksplisitt godkjenning.
+
+## Feilkode 3176
+
+`midea-local 12.2.0` har ikke 3176 i `CLOUD_ERRORS` eller
+`RAISE_FOR_ERROR_CODES`. Selv når integrasjonen kaller
+`_api_request(..., raise_for_error=True)`, logger biblioteket derfor
+`3176 (cloud_error): The asyn reply does not exist` og returnerer `None` i
+stedet for å kaste `MideaCloudError`. `transparent_send()` kan dermed ikke se
+feilkoden og returnerer også `None`.
+
+For statuslesing behandles et slikt tomt svar som transient. Statuskall er
+idempotente og kan gjentas opptil tre ganger med eksponentiell backoff og jitter.
+3176 utløser ikke login eller sesjonsfornyelse.
+
+For styringskommandoer er tomt svar tvetydig: skyen kan ha sendt kommandoen til
+anlegget før det asynkrone svaret forsvant. Integrasjonen sender derfor aldri
+kommandoen automatisk på nytt. Den venter kontrollert og leser status for å
+verifisere bare feltene brukeren ba om å endre. Bekreftet tilstand regnes som
+suksess; ellers rapporteres en `CloudCommandUncertainError`.

@@ -14,6 +14,7 @@ from midealocal.exceptions import MideaCloudError
 from custom_components.midea_cloud_control import client as client_module
 from custom_components.midea_cloud_control.client import (
     CloudAuthenticationError,
+    CloudCommandUncertainError,
     CloudCooldownError,
     CloudInvalidAuthError,
     CloudUnavailableError,
@@ -209,6 +210,81 @@ async def test_9999_is_retried_then_surfaced_without_reauthentication() -> None:
 
 
 @pytest.mark.asyncio
+async def test_3176_none_during_polling_is_retried_without_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """midea-local logs 3176 and returns None even with raise_for_error."""
+    cloud = FakeCloud()
+    sleeps: list[float] = []
+    send_calls = 0
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    client = make_client(
+        lambda *_args: cloud,
+        policy=RetryPolicy(status_attempts=3, base_delay=1, jitter=0),
+        sleep=record_sleep,
+    )
+    await client.connect()
+
+    class FakeState:
+        pass
+
+    class FakeResponse:
+        @staticmethod
+        def construct(_reply: bytes) -> FakeState:
+            return FakeState()
+
+    async def fake_send(*_args: object) -> bytes | None:
+        nonlocal send_calls
+        send_calls += 1
+        return None if send_calls == 1 else b"reply"
+
+    monkeypatch.setattr(client_module, "StateResponse", FakeState)
+    monkeypatch.setattr(client_module, "Response", FakeResponse)
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+
+    assert isinstance(await client.query(123), FakeState)
+    assert send_calls == 2
+    assert sleeps == [1]
+    assert cloud.login_calls == 1
+    assert client.generation == 1
+
+
+@pytest.mark.asyncio
+async def test_persistent_3176_polling_is_reported_without_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud = FakeCloud()
+    sleeps: list[float] = []
+    send_calls = 0
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    client = make_client(
+        lambda *_args: cloud,
+        policy=RetryPolicy(status_attempts=3, base_delay=1, jitter=0),
+        sleep=record_sleep,
+    )
+
+    async def fake_send(*_args: object) -> bytes:
+        nonlocal send_calls
+        send_calls += 1
+        raise MideaCloudError(3176, "The asyn reply does not exist")
+
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+
+    with pytest.raises(CloudUnavailableError):
+        await client.query(123)
+    assert send_calls == 3
+    assert sleeps == [1, 2]
+    assert cloud.login_calls == 1
+    assert client.generation == 1
+
+
+@pytest.mark.asyncio
 async def test_network_recovers_on_next_poll() -> None:
     cloud = FakeCloud(
         responses=[
@@ -282,3 +358,97 @@ async def test_temperature_change_targets_only_requested_appliance(
     await client.set_state(222, target_temperature=23.5)
 
     assert sent == [(222, 23.5)]
+
+
+@pytest.mark.asyncio
+async def test_3176_command_is_sent_once_then_verified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud = FakeCloud()
+    sleeps: list[float] = []
+    client = make_client(
+        lambda *_args: cloud,
+        policy=RetryPolicy(
+            command_verification_attempts=2, base_delay=1, jitter=0
+        ),
+        sleep=lambda delay: _record_delay(sleeps, delay),
+    )
+    await client.connect()
+
+    current = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    verified = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    verified.power_on = True
+    client.query = AsyncMock(side_effect=[current, verified])  # type: ignore[method-assign]
+
+    send_calls = 0
+
+    class FakeCommand:
+        def tobytes(self) -> bytes:
+            return b"command"
+
+    async def fake_send(*_args: object) -> None:
+        nonlocal send_calls
+        send_calls += 1
+        return None
+
+    monkeypatch.setattr(client_module, "SetStateCommand", FakeCommand)
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+
+    assert await client.set_state(222, power_on=True) is verified
+    assert send_calls == 1
+    assert client.query.await_count == 2
+    assert sleeps == [1]
+    assert cloud.login_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_3176_command_is_never_replayed_when_verification_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cloud = FakeCloud()
+    sleeps: list[float] = []
+    client = make_client(
+        lambda *_args: cloud,
+        policy=RetryPolicy(
+            command_verification_attempts=2, base_delay=1, jitter=0
+        ),
+        sleep=lambda delay: _record_delay(sleeps, delay),
+    )
+
+    current = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    mismatch = SimpleNamespace(
+        **{field: False for field in client_module._CARRIED_STATE}
+    )
+    client.query = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[current, mismatch, mismatch]
+    )
+
+    send_calls = 0
+
+    class FakeCommand:
+        def tobytes(self) -> bytes:
+            return b"command"
+
+    async def fake_send(*_args: object) -> None:
+        nonlocal send_calls
+        send_calls += 1
+        return None
+
+    monkeypatch.setattr(client_module, "SetStateCommand", FakeCommand)
+    monkeypatch.setattr(client_module, "transparent_send", fake_send)
+
+    with pytest.raises(CloudCommandUncertainError):
+        await client.set_state(222, power_on=True)
+    assert send_calls == 1
+    assert client.query.await_count == 3
+    assert sleeps == [1, 2]
+
+
+async def _record_delay(delays: list[float], delay: float) -> None:
+    delays.append(delay)

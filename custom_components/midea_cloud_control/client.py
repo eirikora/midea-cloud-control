@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -21,7 +22,8 @@ _LOGGER = logging.getLogger(__name__)
 
 SUPPORTED = ("Ariston Clima", "NetHome Plus", "Midea Air")
 _SESSION_ERROR_CODES = frozenset({3106, 3144})
-_TRANSIENT_ERROR_CODES = frozenset({9999})
+_LOGIN_TRANSIENT_ERROR_CODES = frozenset({9999})
+_REQUEST_TRANSIENT_ERROR_CODES = frozenset({3176, 9999})
 _INVALID_AUTH_CODES = frozenset({3101, 3102, 3301})
 _DEFAULT_MAX_CONCURRENT_REQUESTS = 2
 _DEFAULT_MIN_REQUEST_INTERVAL = 0.75
@@ -73,6 +75,10 @@ class CloudProtocolError(CloudError):
     """Raised for an invalid or unexpected appliance response."""
 
 
+class CloudCommandUncertainError(CloudError):
+    """Raised when a command may have run but its state cannot be verified."""
+
+
 class _TransientRequestError(Exception):
     """Internal marker for retryable empty/network responses."""
 
@@ -85,6 +91,8 @@ class RetryPolicy:
     # midea-local already retries each HTTP call up to three times. Two outer
     # attempts keep recovery bounded while still handling an empty response.
     request_attempts: int = 2
+    status_attempts: int = 3
+    command_verification_attempts: int = 2
     base_delay: float = 1.0
     maximum_delay: float = 30.0
     jitter: float = 0.25
@@ -183,7 +191,7 @@ class MideaCloudClient:
             except MideaCloudError as err:
                 last_error = err
                 last_code = err.code
-                if err.code not in _SESSION_ERROR_CODES | _TRANSIENT_ERROR_CODES:
+                if err.code not in _SESSION_ERROR_CODES | _LOGIN_TRANSIENT_ERROR_CODES:
                     if err.code in _INVALID_AUTH_CODES:
                         raise CloudInvalidAuthError(
                             f"Cloud credentials were rejected with code {err.code}"
@@ -304,7 +312,9 @@ class MideaCloudClient:
                 )
             return response
 
-        return await self._execute(operation)
+        return await self._execute(
+            operation, max_attempts=self._policy.status_attempts
+        )
 
     async def set_state(
         self, appliance_id: int, *, beep: bool = False, **changes: Any
@@ -340,13 +350,25 @@ class MideaCloudClient:
                     )
                 return response
 
-            return await self._execute(operation)
+            try:
+                return await self._execute(operation, retry_transient=False)
+            except CloudCommandUncertainError as err:
+                return await self._verify_uncertain_command(
+                    appliance_id, changes, err
+                )
 
-    async def _execute(self, operation: Callable[[Any], Awaitable[_T]]) -> _T:
+    async def _execute(
+        self,
+        operation: Callable[[Any], Awaitable[_T]],
+        *,
+        max_attempts: int | None = None,
+        retry_transient: bool = True,
+    ) -> _T:
         last_error: Exception | None = None
         session_refreshes = 0
+        attempts = max_attempts or self._policy.request_attempts
 
-        for attempt in range(self._policy.request_attempts):
+        for attempt in range(attempts):
             await self.connect()
             cloud = self._cloud
             generation = self._generation
@@ -364,7 +386,7 @@ class MideaCloudClient:
                     await self._refresh_if_current(generation)
                     session_refreshes += 1
                     continue
-                if err.code not in _TRANSIENT_ERROR_CODES:
+                if err.code not in _REQUEST_TRANSIENT_ERROR_CODES:
                     raise CloudError(
                         f"Cloud request was rejected with code {err.code}"
                     ) from err
@@ -372,12 +394,61 @@ class MideaCloudClient:
             except (_TransientRequestError, aiohttp.ClientError, TimeoutError, OSError) as err:
                 last_error = err
 
-            if attempt < self._policy.request_attempts - 1:
+            if not retry_transient:
+                raise CloudCommandUncertainError(
+                    "Cloud command acknowledgement was not received"
+                ) from last_error
+
+            if attempt < attempts - 1:
                 await self._backoff(attempt)
 
         raise CloudUnavailableError(
-            f"Cloud request failed after {self._policy.request_attempts} attempts"
+            f"Cloud request failed after {attempts} attempts"
         ) from last_error
+
+    async def _verify_uncertain_command(
+        self,
+        appliance_id: int,
+        changes: dict[str, Any],
+        command_error: CloudCommandUncertainError,
+    ) -> StateResponse:
+        """Verify an uncertain command without ever sending it a second time."""
+        last_query_error: CloudError | None = None
+        for attempt in range(self._policy.command_verification_attempts):
+            await self._backoff(attempt)
+            try:
+                state = await self.query(appliance_id)
+            except CloudError as err:
+                last_query_error = err
+                continue
+            if self._state_matches_changes(state, changes):
+                return state
+            last_query_error = None
+
+        error = CloudCommandUncertainError(
+            "Cloud command acknowledgement was missing and the requested state "
+            "could not be verified"
+        )
+        if last_query_error is not None:
+            raise error from last_query_error
+        raise error from command_error
+
+    @staticmethod
+    def _state_matches_changes(state: StateResponse, changes: dict[str, Any]) -> bool:
+        """Return whether the explicitly requested fields match current state."""
+        for field, expected in changes.items():
+            actual = getattr(state, field, None)
+            if (
+                isinstance(expected, (int, float))
+                and not isinstance(expected, bool)
+                and isinstance(actual, (int, float))
+                and not isinstance(actual, bool)
+            ):
+                if not math.isclose(float(actual), float(expected), abs_tol=0.1):
+                    return False
+            elif actual != expected:
+                return False
+        return True
 
     async def _refresh_if_current(self, failed_generation: int) -> None:
         """Refresh once when concurrent requests observe the same expired session."""

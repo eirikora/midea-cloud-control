@@ -3,8 +3,26 @@
 from __future__ import annotations
 
 import pytest
+from midealocal.cloud import RAISE_FOR_ERROR_CODES, MideaCloud
+from midealocal.exceptions import CLOUD_ERRORS
 
 from custom_components.midea_cloud_control import protocol
+
+
+def test_midea_local_3176_is_logged_but_not_raised() -> None:
+    """Pin the midea-local 12.2.0 behavior that turns 3176 into None."""
+    assert 3176 not in CLOUD_ERRORS
+    assert 3176 not in RAISE_FOR_ERROR_CODES
+    assert (
+        MideaCloud._handle_error_code(  # type: ignore[arg-type]
+            None,
+            "https://mapp.appsmb.com/v1/appliance/transparent/send",
+            3176,
+            "The asyn reply does not exist",
+            True,
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
