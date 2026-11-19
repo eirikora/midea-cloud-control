@@ -1,57 +1,143 @@
-"""Cloud-relayed control for Midea-protocol air conditioners.
-
-Works with any Midea white-label cloud that still serves the legacy
-mapp.appsmb.com API -- Ariston Clima, NetHome Plus and Midea Air.
-"""
+"""Cloud-relayed control for Midea-protocol air conditioners."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from typing import Any
+import random
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, TypeVar
 
 import aiohttp
 from midealocal.cloud import SUPPORTED_CLOUDS, get_midea_cloud
+from midealocal.exceptions import MideaCloudError
 from msmart.device.AC.command import GetStateCommand, Response, SetStateCommand, StateResponse
 
 from .protocol import transparent_send
 
 _LOGGER = logging.getLogger(__name__)
 
-# Clouds sharing the legacy mapp.appsmb.com transparent-send endpoint.
 SUPPORTED = ("Ariston Clima", "NetHome Plus", "Midea Air")
+_SESSION_ERROR_CODES = frozenset({3106, 3144})
+_TRANSIENT_ERROR_CODES = frozenset({9999})
+_INVALID_AUTH_CODES = frozenset({3101, 3102, 3301})
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 2
+_DEFAULT_MIN_REQUEST_INTERVAL = 0.75
 
-# Fields copied verbatim from current state when issuing a set command, so a
-# partial change never silently resets unrelated settings.
 _CARRIED_STATE = (
-    "power_on", "target_temperature", "operational_mode", "fan_speed",
-    "eco", "swing_mode", "turbo", "fahrenheit", "sleep",
-    "freeze_protection", "follow_me", "purifier", "target_humidity",
-    "aux_heat", "independent_aux_heat",
+    "power_on",
+    "target_temperature",
+    "operational_mode",
+    "fan_speed",
+    "eco",
+    "swing_mode",
+    "turbo",
+    "fahrenheit",
+    "sleep",
+    "freeze_protection",
+    "follow_me",
+    "purifier",
+    "target_humidity",
+    "aux_heat",
+    "independent_aux_heat",
 )
+
+_T = TypeVar("_T")
 
 
 class CloudError(Exception):
-    """Raised when the cloud rejects a request."""
+    """Base error raised by this integration's cloud layer."""
+
+
+class CloudAuthenticationError(CloudError):
+    """Raised after a bounded authentication failure."""
+
+
+class CloudInvalidAuthError(CloudAuthenticationError):
+    """Raised when credentials or the selected cloud are rejected."""
+
+
+class CloudUnavailableError(CloudError):
+    """Raised after bounded transient request failures."""
+
+
+class CloudCooldownError(CloudUnavailableError):
+    """Raised while login cooldown is active."""
+
+
+class CloudProtocolError(CloudError):
+    """Raised for an invalid or unexpected appliance response."""
+
+
+class _TransientRequestError(Exception):
+    """Internal marker for retryable empty/network responses."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Bounded retry and cooldown settings."""
+
+    login_attempts: int = 3
+    # midea-local already retries each HTTP call up to three times. Two outer
+    # attempts keep recovery bounded while still handling an empty response.
+    request_attempts: int = 2
+    base_delay: float = 1.0
+    maximum_delay: float = 30.0
+    jitter: float = 0.25
+    cooldown: float = 60.0
 
 
 class MideaCloudClient:
-    """Control a Midea appliance through its vendor cloud."""
+    """Control appliances through one resilient, shared vendor-cloud session."""
 
-    def __init__(self, account: str, password: str,
-                 cloud_name: str = "Ariston Clima",
-                 session: aiohttp.ClientSession | None = None) -> None:
+    def __init__(
+        self,
+        account: str,
+        password: str,
+        cloud_name: str = "Ariston Clima",
+        session: aiohttp.ClientSession | None = None,
+        *,
+        max_concurrent_requests: int = _DEFAULT_MAX_CONCURRENT_REQUESTS,
+        min_request_interval: float = _DEFAULT_MIN_REQUEST_INTERVAL,
+        retry_policy: RetryPolicy | None = None,
+        cloud_factory: Callable[..., Any] = get_midea_cloud,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        monotonic: Callable[[], float] = time.monotonic,
+        random_value: Callable[[], float] = random.random,
+    ) -> None:
         if cloud_name not in SUPPORTED:
             raise ValueError(
                 f"{cloud_name!r} does not serve the transparent-send endpoint; "
                 f"expected one of {SUPPORTED}"
             )
+        if max_concurrent_requests < 1:
+            raise ValueError("max_concurrent_requests must be at least 1")
+        if min_request_interval < 0:
+            raise ValueError("min_request_interval cannot be negative")
+
         self._account = account
         self._password = password
         self._cloud_name = cloud_name
         self._app_key = str(SUPPORTED_CLOUDS[cloud_name]["app_key"])
         self._session = session
         self._owns_session = session is None
+        self._cloud_factory = cloud_factory
         self._cloud: Any = None
+
+        self._policy = retry_policy or RetryPolicy()
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._random = random_value
+        self._auth_lock = asyncio.Lock()
+        self._request_semaphore = asyncio.Semaphore(max_concurrent_requests)
+        self._rate_lock = asyncio.Lock()
+        self._device_locks: dict[int, asyncio.Lock] = {}
+        self._min_request_interval = min_request_interval
+        self._next_request_at = 0.0
+        self._generation = 0
+        self._cooldown_until = 0.0
 
     async def __aenter__(self) -> MideaCloudClient:
         await self.connect()
@@ -60,56 +146,207 @@ class MideaCloudClient:
     async def __aexit__(self, *exc: object) -> None:
         await self.close()
 
+    @property
+    def generation(self) -> int:
+        """Return the successful authentication generation for diagnostics/tests."""
+        return self._generation
+
     async def connect(self) -> None:
-        if self._session is None:
-            self._session = aiohttp.ClientSession()
-        self._cloud = get_midea_cloud(
-            self._cloud_name, self._session, self._account, self._password)
-        if not await self._cloud.login():
-            raise CloudError(f"login failed for {self._account} on {self._cloud_name}")
-        _LOGGER.debug("Logged in to %s", self._cloud_name)
+        """Authenticate once; concurrent callers share the same login attempt."""
+        if self._cloud is not None:
+            return
+        async with self._auth_lock:
+            if self._cloud is not None:
+                return
+            await self._connect_locked()
+
+    async def _connect_locked(self) -> None:
+        now = self._monotonic()
+        if now < self._cooldown_until:
+            raise CloudCooldownError("Cloud login is temporarily in cooldown")
+
+        last_code: int | None = None
+        last_error: Exception | None = None
+        for attempt in range(self._policy.login_attempts):
+            if self._session is None:
+                self._session = aiohttp.ClientSession()
+
+            # MideaAirCloud adds sessionId to future requests once authenticated.
+            # A fresh object is required so an expired ID cannot poison relogin.
+            candidate = self._cloud_factory(
+                self._cloud_name, self._session, self._account, self._password
+            )
+            try:
+                logged_in = await candidate.login()
+            except MideaCloudError as err:
+                last_error = err
+                last_code = err.code
+                if err.code not in _SESSION_ERROR_CODES | _TRANSIENT_ERROR_CODES:
+                    if err.code in _INVALID_AUTH_CODES:
+                        raise CloudInvalidAuthError(
+                            f"Cloud credentials were rejected with code {err.code}"
+                        ) from err
+                    self._cooldown_until = self._monotonic() + self._policy.cooldown
+                    raise CloudAuthenticationError(
+                        f"Cloud login was rejected with code {err.code}"
+                    ) from err
+                logged_in = False
+            except (aiohttp.ClientError, TimeoutError, OSError) as err:
+                last_error = err
+                logged_in = False
+
+            if logged_in:
+                self._cloud = candidate
+                self._generation += 1
+                self._cooldown_until = 0.0
+                _LOGGER.debug(
+                    "Authenticated shared %s cloud session (generation %s)",
+                    self._cloud_name,
+                    self._generation,
+                )
+                return
+
+            if attempt < self._policy.login_attempts - 1:
+                await self._backoff(attempt)
+
+        self._cloud = None
+        self._cooldown_until = self._monotonic() + self._policy.cooldown
+        detail = f" code {last_code}" if last_code is not None else ""
+        error = CloudAuthenticationError(
+            f"Cloud login failed after {self._policy.login_attempts} attempts{detail}"
+        )
+        if last_error is not None:
+            raise error from last_error
+        raise error
 
     async def close(self) -> None:
-        if self._owns_session and self._session is not None:
-            await self._session.close()
-            self._session = None
+        """Discard authentication state and close only self-owned HTTP sessions."""
+        async with self._auth_lock:
+            self._cloud = None
+            if self._owns_session and self._session is not None:
+                await self._session.close()
+                self._session = None
 
     async def list_appliances(self) -> dict[int, dict[str, Any]]:
-        return await self._cloud.list_appliances(None) or {}
+        """List all appliances visible to the shared account."""
+        result = await self._execute(lambda cloud: cloud.list_appliances(None))
+        return result or {}
 
     async def query(self, appliance_id: int) -> StateResponse:
-        """Read current state of the appliance."""
-        reply = await transparent_send(
-            self._cloud, appliance_id, GetStateCommand().tobytes(), self._app_key)
-        if reply is None:
-            raise CloudError(f"no reply from appliance {appliance_id}")
-        response = Response.construct(reply)
-        if not isinstance(response, StateResponse):
-            raise CloudError(f"unexpected response type {type(response).__name__}")
-        return response
+        """Read current state of one appliance."""
 
-    async def set_state(self, appliance_id: int, *, beep: bool = False,
-                        **changes: Any) -> StateResponse:
-        """Apply `changes` on top of current state, then return the new state.
+        async def operation(cloud: Any) -> StateResponse:
+            reply = await transparent_send(
+                cloud, appliance_id, GetStateCommand().tobytes(), self._app_key
+            )
+            if reply is None:
+                raise _TransientRequestError("Cloud returned no appliance reply")
+            try:
+                response = Response.construct(reply)
+            except (ValueError, IndexError) as err:
+                raise CloudProtocolError("Could not decode appliance response") from err
+            if not isinstance(response, StateResponse):
+                raise CloudProtocolError(
+                    f"Unexpected appliance response type {type(response).__name__}"
+                )
+            return response
 
-        Midea set commands carry the *entire* state, so current values are read
-        first and merged -- otherwise setting one field resets the others.
-        """
+        return await self._execute(operation)
+
+    async def set_state(
+        self, appliance_id: int, *, beep: bool = False, **changes: Any
+    ) -> StateResponse:
+        """Apply changes on top of current state, then return the acknowledgement."""
         unknown = set(changes) - set(_CARRIED_STATE)
         if unknown:
             raise ValueError(f"unsupported field(s): {sorted(unknown)}")
 
-        current = await self.query(appliance_id)
+        device_lock = self._device_locks.setdefault(appliance_id, asyncio.Lock())
+        async with device_lock:
+            current = await self.query(appliance_id)
+            command = SetStateCommand()
+            command.beep_on = beep
+            for field in _CARRIED_STATE:
+                setattr(command, field, getattr(current, field))
+            for field, value in changes.items():
+                setattr(command, field, value)
 
-        command = SetStateCommand()
-        command.beep_on = beep
-        for field in _CARRIED_STATE:
-            setattr(command, field, getattr(current, field))
-        for field, value in changes.items():
-            setattr(command, field, value)
+            async def operation(cloud: Any) -> StateResponse:
+                reply = await transparent_send(
+                    cloud, appliance_id, command.tobytes(), self._app_key
+                )
+                if reply is None:
+                    raise _TransientRequestError("Cloud did not acknowledge command")
+                try:
+                    response = Response.construct(reply)
+                except (ValueError, IndexError) as err:
+                    raise CloudProtocolError("Could not decode command response") from err
+                if not isinstance(response, StateResponse):
+                    raise CloudProtocolError(
+                        f"Unexpected command response type {type(response).__name__}"
+                    )
+                return response
 
-        reply = await transparent_send(
-            self._cloud, appliance_id, command.tobytes(), self._app_key)
-        if reply is None:
-            raise CloudError(f"appliance {appliance_id} did not acknowledge command")
-        return Response.construct(reply)
+            return await self._execute(operation)
+
+    async def _execute(self, operation: Callable[[Any], Awaitable[_T]]) -> _T:
+        last_error: Exception | None = None
+        session_refreshes = 0
+
+        for attempt in range(self._policy.request_attempts):
+            await self.connect()
+            cloud = self._cloud
+            generation = self._generation
+            try:
+                result = await self._limited_call(lambda cloud=cloud: operation(cloud))
+                if result is None:
+                    raise _TransientRequestError("Cloud returned an empty response")
+                return result
+            except MideaCloudError as err:
+                if err.code in _SESSION_ERROR_CODES:
+                    if session_refreshes >= 1:
+                        raise CloudAuthenticationError(
+                            f"Cloud session remained invalid after refresh (code {err.code})"
+                        ) from err
+                    await self._refresh_if_current(generation)
+                    session_refreshes += 1
+                    continue
+                if err.code not in _TRANSIENT_ERROR_CODES:
+                    raise CloudError(
+                        f"Cloud request was rejected with code {err.code}"
+                    ) from err
+                last_error = err
+            except (_TransientRequestError, aiohttp.ClientError, TimeoutError, OSError) as err:
+                last_error = err
+
+            if attempt < self._policy.request_attempts - 1:
+                await self._backoff(attempt)
+
+        raise CloudUnavailableError(
+            f"Cloud request failed after {self._policy.request_attempts} attempts"
+        ) from last_error
+
+    async def _refresh_if_current(self, failed_generation: int) -> None:
+        """Refresh once when concurrent requests observe the same expired session."""
+        async with self._auth_lock:
+            if self._cloud is not None and self._generation != failed_generation:
+                return
+            self._cloud = None
+            await self._connect_locked()
+
+    async def _limited_call(self, operation: Callable[[], Awaitable[_T]]) -> _T:
+        async with self._request_semaphore:
+            async with self._rate_lock:
+                delay = self._next_request_at - self._monotonic()
+                if delay > 0:
+                    await self._sleep(delay)
+                self._next_request_at = self._monotonic() + self._min_request_interval
+            return await operation()
+
+    async def _backoff(self, attempt: int) -> None:
+        base = min(
+            self._policy.maximum_delay,
+            self._policy.base_delay * (2**attempt),
+        )
+        jitter = base * self._policy.jitter * self._random()
+        await self._sleep(base + jitter)

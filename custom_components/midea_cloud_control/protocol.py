@@ -94,7 +94,11 @@ async def transparent_send(cloud: Any, appliance_id: int, frame: bytes,
         "applianceId": str(appliance_id),
     })
 
-    response = await cloud._api_request(endpoint=_ENDPOINT, data=data)
+    # midea-local only surfaces 3106/3144 as structured exceptions when this
+    # flag is set. The shared client can then replace the expired cloud object.
+    response = await cloud._api_request(
+        endpoint=_ENDPOINT, data=data, raise_for_error=True
+    )
     if not response or "reply" not in response:
         _LOGGER.warning("transparent_send: no reply for appliance %s", appliance_id)
         return None

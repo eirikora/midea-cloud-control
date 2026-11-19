@@ -7,21 +7,41 @@
         "data": {
           "username": "Email address",
           "password": "Password",
-          "cloud": "App / cloud"
+          "cloud": "App / cloud",
+          "scan_interval": "Base polling interval (seconds)"
         }
       },
-      "appliance": {
-        "title": "Select appliance",
-        "data": { "appliance_id": "Appliance" }
+      "appliances": {
+        "title": "Select appliances",
+        "description": "All selected appliances share one authenticated cloud session.",
+        "data": { "appliances": "Appliances" }
       }
     },
     "error": {
       "invalid_auth": "Login failed. Check the email, password, and that the selected app matches the one your appliance is registered in.",
+      "cannot_connect": "The cloud is temporarily unavailable. Try again later.",
+      "select_appliance": "Select at least one appliance.",
       "no_appliances": "Login succeeded but no appliances were found on this account.",
       "unknown": "Unexpected error. Check the Home Assistant logs."
     },
     "abort": {
-      "already_configured": "This appliance is already configured."
+      "already_configured": "This cloud account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Midea Cloud Control options",
+        "description": "Select the appliances that share this account session and adjust polling.",
+        "data": {
+          "appliances": "Appliances",
+          "scan_interval": "Base polling interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "The cloud is temporarily unavailable. Try again later.",
+      "select_appliance": "Select at least one appliance."
     }
   }
 }

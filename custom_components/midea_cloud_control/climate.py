@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from homeassistant.components.climate import (
-    ClimateEntity, ClimateEntityFeature, HVACMode,
+    ClimateEntity,
+    ClimateEntityFeature,
+    HVACMode,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, PRECISION_HALVES, UnitOfTemperature
@@ -15,18 +17,30 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
-    DOMAIN, FAN_TO_SPEED, HVAC_TO_MODE, MAX_TEMP, MIN_TEMP, MODE_TO_HVAC,
-    MODE_TO_SWING, SPEED_TO_FAN, SWING_TO_MODE,
+    DOMAIN,
+    FAN_TO_SPEED,
+    HVAC_TO_MODE,
+    MAX_TEMP,
+    MIN_TEMP,
+    MODE_TO_HVAC,
+    MODE_TO_SWING,
+    SPEED_TO_FAN,
+    SWING_TO_MODE,
 )
 from .coordinator import MideaCloudCoordinator
+
+if TYPE_CHECKING:
+    from . import MideaCloudRuntimeData
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     """Set up the climate entity for a config entry."""
-    coordinator: MideaCloudCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([MideaCloudClimate(coordinator, entry)])
+    runtime: MideaCloudRuntimeData = hass.data[DOMAIN][entry.entry_id]
+    async_add_entities(
+        [MideaCloudClimate(coordinator, entry) for coordinator in runtime.coordinators]
+    )
 
 
 class MideaCloudClimate(CoordinatorEntity[MideaCloudCoordinator], ClimateEntity):
@@ -39,9 +53,9 @@ class MideaCloudClimate(CoordinatorEntity[MideaCloudCoordinator], ClimateEntity)
     _attr_target_temperature_step = 0.5
     _attr_min_temp = MIN_TEMP
     _attr_max_temp = MAX_TEMP
-    _attr_hvac_modes = [HVACMode.OFF, *MODE_TO_HVAC.values()]
-    _attr_fan_modes = list(FAN_TO_SPEED)
-    _attr_swing_modes = list(SWING_TO_MODE)
+    _attr_hvac_modes: ClassVar[list[HVACMode]] = [HVACMode.OFF, *MODE_TO_HVAC.values()]
+    _attr_fan_modes: ClassVar[list[str]] = list(FAN_TO_SPEED)
+    _attr_swing_modes: ClassVar[list[str]] = list(SWING_TO_MODE)
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
         | ClimateEntityFeature.FAN_MODE

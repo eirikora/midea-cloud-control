@@ -17,7 +17,11 @@ import sys
 import types
 
 # Load the integration's modules without importing its Home Assistant entry point.
-_COMPONENT = pathlib.Path(__file__).resolve().parents[1] / "custom_components" / "midea_cloud_control"
+_COMPONENT = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "custom_components"
+    / "midea_cloud_control"
+)
 _pkg = types.ModuleType("_mcc")
 _pkg.__path__ = [str(_COMPONENT)]
 sys.modules["_mcc"] = _pkg
@@ -75,7 +79,7 @@ def main() -> int:
     p.add_argument("command", choices=("list", "state", "set"))
     p.add_argument("--user", required=True)
     p.add_argument("--password", required=True)
-    p.add_argument("--cloud", default=SUPPORTED[0], choices=SUPPORTED)
+    p.add_argument("--cloud", default="NetHome Plus", choices=SUPPORTED)
     p.add_argument("--id", type=int, help="appliance id")
     p.add_argument("--temp", type=float, help="target temperature")
     p.add_argument("--power", choices=("on", "off"))

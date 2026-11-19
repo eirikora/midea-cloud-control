@@ -5,8 +5,15 @@ from __future__ import annotations
 from datetime import timedelta
 
 from homeassistant.components.climate import (
-    FAN_AUTO, FAN_HIGH, FAN_LOW, FAN_MEDIUM,
-    SWING_BOTH, SWING_HORIZONTAL, SWING_OFF, SWING_VERTICAL, HVACMode,
+    FAN_AUTO,
+    FAN_HIGH,
+    FAN_LOW,
+    FAN_MEDIUM,
+    SWING_BOTH,
+    SWING_HORIZONTAL,
+    SWING_OFF,
+    SWING_VERTICAL,
+    HVACMode,
 )
 
 DOMAIN = "midea_cloud_control"
@@ -15,8 +22,19 @@ PLATFORMS = ["climate"]
 CONF_CLOUD = "cloud"
 CONF_APPLIANCE_ID = "appliance_id"
 CONF_APPLIANCE_NAME = "appliance_name"
+CONF_APPLIANCES = "appliances"
+CONF_SCAN_INTERVAL = "scan_interval"
 
-DEFAULT_SCAN_INTERVAL = timedelta(seconds=30)
+DATA_SESSION_REGISTRY = "session_registry"
+
+DEFAULT_SCAN_INTERVAL_SECONDS = 90
+MIN_SCAN_INTERVAL_SECONDS = 60
+MAX_SCAN_INTERVAL_SECONDS = 120
+POLL_SPREAD_SECONDS = 30
+DEFAULT_SCAN_INTERVAL = timedelta(seconds=DEFAULT_SCAN_INTERVAL_SECONDS)
+
+DEFAULT_MAX_CONCURRENT_REQUESTS = 2
+DEFAULT_MIN_REQUEST_INTERVAL = 0.75
 
 FAN_SILENT = "silent"
 FAN_MAX = "max"

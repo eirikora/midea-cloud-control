@@ -1,55 +1,135 @@
-"""Midea Cloud Control integration.
-
-Controls Midea-protocol appliances via the vendor cloud's transparent-send
-endpoint, for devices that cannot be controlled locally because Midea retired
-the token service that local control depends on.
-"""
+"""Midea Cloud Control integration."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from dataclasses import dataclass
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .client import CloudError, MideaCloudClient
-from .const import CONF_APPLIANCE_ID, CONF_APPLIANCE_NAME, CONF_CLOUD, DOMAIN, PLATFORMS
+from .client import CloudError, CloudInvalidAuthError, MideaCloudClient
+from .const import (
+    CONF_APPLIANCE_ID,
+    CONF_APPLIANCE_NAME,
+    CONF_APPLIANCES,
+    CONF_CLOUD,
+    CONF_SCAN_INTERVAL,
+    DATA_SESSION_REGISTRY,
+    DEFAULT_SCAN_INTERVAL_SECONDS,
+    DOMAIN,
+    PLATFORMS,
+)
 from .coordinator import MideaCloudCoordinator
+from .session import CloudSessionRegistry
 
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(slots=True)
+class MideaCloudRuntimeData:
+    """Runtime resources owned by one config entry."""
+
+    client: MideaCloudClient
+    coordinators: list[MideaCloudCoordinator]
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Convert a version-1 single-appliance entry without changing entity IDs."""
+    if entry.version != 1:
+        return True
+
+    data = dict(entry.data)
+    appliance = {
+        CONF_APPLIANCE_ID: int(data.pop(CONF_APPLIANCE_ID)),
+        CONF_APPLIANCE_NAME: data.pop(CONF_APPLIANCE_NAME),
+    }
+    data[CONF_APPLIANCES] = [appliance]
+    data.setdefault(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_SECONDS)
+    hass.config_entries.async_update_entry(entry, data=data, version=2)
+    _LOGGER.info("Migrated Midea Cloud Control entry to account-based schema")
+    return True
+
+
+def _registry(hass: HomeAssistant) -> CloudSessionRegistry:
+    domain_data = hass.data.setdefault(DOMAIN, {})
+    registry = domain_data.get(DATA_SESSION_REGISTRY)
+    if registry is None:
+        registry = CloudSessionRegistry(async_get_clientsession(hass))
+        domain_data[DATA_SESSION_REGISTRY] = registry
+    return registry
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up a config entry."""
-    client = MideaCloudClient(
-        entry.data[CONF_USERNAME],
-        entry.data[CONF_PASSWORD],
-        entry.data[CONF_CLOUD],
-        session=async_get_clientsession(hass),
-    )
+    """Set up one account entry containing one or more appliances."""
+    registry = _registry(hass)
+    account = entry.data[CONF_USERNAME]
+    cloud_name = entry.data[CONF_CLOUD]
 
     try:
-        await client.connect()
-    except CloudError as err:
-        raise ConfigEntryNotReady(f"Could not log in to {entry.data[CONF_CLOUD]}: {err}") from err
+        client = await registry.acquire(
+            account, entry.data[CONF_PASSWORD], cloud_name
+        )
+    except CloudInvalidAuthError as err:
+        raise ConfigEntryAuthFailed("Cloud credentials were rejected") from err
+    except (CloudError, ValueError) as err:
+        raise ConfigEntryNotReady(
+            f"Could not establish shared {cloud_name} session: {err}"
+        ) from err
 
-    coordinator = MideaCloudCoordinator(
-        hass, client,
-        int(entry.data[CONF_APPLIANCE_ID]),
-        entry.data[CONF_APPLIANCE_NAME],
+    appliances = entry.options.get(CONF_APPLIANCES, entry.data[CONF_APPLIANCES])
+    scan_interval = int(
+        entry.options.get(
+            CONF_SCAN_INTERVAL,
+            entry.data.get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL_SECONDS),
+        )
     )
-    await coordinator.async_config_entry_first_refresh()
+    coordinators = [
+        MideaCloudCoordinator(
+            hass,
+            entry,
+            client,
+            int(appliance[CONF_APPLIANCE_ID]),
+            appliance[CONF_APPLIANCE_NAME],
+            scan_interval=scan_interval,
+        )
+        for appliance in appliances
+    ]
 
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    try:
+        # A single offline unit must not prevent the other 14 entities loading.
+        # The request gate spaces these concurrent refreshes at the cloud edge.
+        await asyncio.gather(*(coordinator.async_refresh() for coordinator in coordinators))
+        if not any(coordinator.last_update_success for coordinator in coordinators):
+            raise ConfigEntryNotReady("No configured appliance could be reached")
+
+        hass.data[DOMAIN][entry.entry_id] = MideaCloudRuntimeData(
+            client, coordinators
+        )
+        entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        await registry.release(account, cloud_name)
+        raise
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-    return unloaded
+    """Unload entities and release the account session reference."""
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
+
+    hass.data[DOMAIN].pop(entry.entry_id, None)
+    registry: CloudSessionRegistry = hass.data[DOMAIN][DATA_SESSION_REGISTRY]
+    await registry.release(entry.data[CONF_USERNAME], entry.data[CONF_CLOUD])
+    return True
+
+
+async def _async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload after appliance selection or polling options change."""
+    await hass.config_entries.async_reload(entry.entry_id)

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from msmart.device.AC.command import StateResponse
 
 from .client import CloudError, MideaCloudClient
-from .const import DEFAULT_SCAN_INTERVAL, DOMAIN
+from .const import (
+    DEFAULT_SCAN_INTERVAL_SECONDS,
+    DOMAIN,
+    MAX_SCAN_INTERVAL_SECONDS,
+    MIN_SCAN_INTERVAL_SECONDS,
+    POLL_SPREAD_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -17,11 +25,27 @@ _LOGGER = logging.getLogger(__name__)
 class MideaCloudCoordinator(DataUpdateCoordinator[StateResponse]):
     """Poll appliance state through the vendor cloud."""
 
-    def __init__(self, hass: HomeAssistant, client: MideaCloudClient,
-                 appliance_id: int, name: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        entry: ConfigEntry,
+        client: MideaCloudClient,
+        appliance_id: int,
+        name: str,
+        scan_interval: int = DEFAULT_SCAN_INTERVAL_SECONDS,
+    ) -> None:
+        base_interval = max(
+            MIN_SCAN_INTERVAL_SECONDS,
+            min(MAX_SCAN_INTERVAL_SECONDS, scan_interval),
+        )
+        spread = min(POLL_SPREAD_SECONDS, MAX_SCAN_INTERVAL_SECONDS - base_interval)
+        offset = appliance_id % (spread + 1) if spread else 0
         super().__init__(
-            hass, _LOGGER, name=f"{DOMAIN} {name}",
-            update_interval=DEFAULT_SCAN_INTERVAL,
+            hass,
+            _LOGGER,
+            config_entry=entry,
+            name=f"{DOMAIN} {name}",
+            update_interval=timedelta(seconds=base_interval + offset),
         )
         self.client = client
         self.appliance_id = appliance_id
